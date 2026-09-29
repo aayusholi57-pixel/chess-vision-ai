@@ -1,9 +1,11 @@
-from pathlib import Path
 import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from torchvision import models, datasets, transforms
 from sklearn.metrics import classification_report, confusion_matrix
+from torchvision import datasets, models, transforms
+
 from training.dataset import MEAN, STD
 
 
@@ -20,13 +22,13 @@ def main():
     model.load_state_dict(data["model_state_dict"])
     model.eval()
 
-    tf = transforms.Compose([
+    transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(MEAN, STD),
     ])
-    ds = datasets.ImageFolder(root / "dataset/val", transform=tf)
-    loader = torch.utils.data.DataLoader(ds, batch_size=64, shuffle=False)
+    dataset = datasets.ImageFolder(root / "dataset/val", transform=transform)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=False)
 
     y_true, y_pred = [], []
     with torch.inference_mode():
