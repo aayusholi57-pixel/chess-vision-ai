@@ -104,3 +104,44 @@ def test_predict_rejects_large_upload(monkeypatch):
         files={"file": ("board.jpg", b"12", "image/jpeg")},
     )
     assert response.status_code == 413
+
+
+def test_batched_square_prediction(monkeypatch, tmp_path):
+    import torch
+    from PIL import Image
+    import app.board as board_module
+
+    for row in range(8):
+        for col in range(8):
+            Image.new("RGB", (100, 100), (128, 128, 128)).save(
+                tmp_path / f"square_r{row}_c{col}.jpg"
+            )
+
+    class FakeModel:
+        def __call__(self, batch):
+            return torch.zeros((batch.shape[0], 13))
+
+    monkeypatch.setattr(
+        board_module,
+        "load_chess_model",
+        lambda: (FakeModel(), board_module.CLASSES, {"ready": True}),
+    )
+    board, confidence = board_module.predict_squares(tmp_path)
+    assert len(board) == 8
+    assert all(len(row) == 8 for row in board)
+    assert len(confidence) == 8
+    assert all(len(row) == 8 for row in confidence)
+
+
+def test_preprocessing_extracts_64_squares(tmp_path):
+    import cv2
+    import numpy as np
+
+    source = tmp_path / "board.jpg"
+    image = np.full((1000, 1000, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (100, 100), (900, 900), (0, 0, 0), 12)
+    cv2.imwrite(str(source), image)
+
+    output = process_uploaded_image(source, tmp_path / "squares")
+    assert len(list(tmp_path.joinpath("squares").glob("square_r*_c*.jpg"))) == 64
+    assert output.endswith("squares")
