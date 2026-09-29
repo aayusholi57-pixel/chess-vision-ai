@@ -1,25 +1,10 @@
-version: '3.8'
-
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: chess-vision-api
+    build: .
     ports:
       - "8000:8000"
-    volumes:
-      - ./app:/app/app
-      - ./models:/app/models
     environment:
-      - PYTHONUNBUFFERED=1
-    develop:
-      watch:
-        - action: sync
-          path: ./app
-          target: /app/app
-          ignore:
-            - __pycache__
-            - "*.pyc"
-        - action: rebuild
-          path: ./requirements.txt
+      ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
+      MIN_CONFIDENCE: "0.55"
+    volumes:
+      - ./models:/app/models:ro
