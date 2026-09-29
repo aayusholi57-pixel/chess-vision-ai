@@ -74,3 +74,33 @@ def test_health_without_model_is_not_healthy():
 
 def test_predict_without_file():
     assert client.post("/predict").status_code == 422
+
+
+def test_predict_success_path(monkeypatch):
+    board = starting_matrix()
+    confidence = [[0.99] * 8 for _ in range(8)]
+    monkeypatch.setattr("app.main.process_uploaded_image", lambda *_args, **_kwargs: "fake-squares")
+    monkeypatch.setattr("app.main.predict_squares", lambda *_args, **_kwargs: (board, confidence))
+    response = client.post(
+        "/predict",
+        files={"file": ("board.jpg", b"fake-image", "image/jpeg")},
+    )
+    assert response.status_code == 200
+    assert response.json()["fen"].startswith("rnbqkbnr/")
+
+
+def test_predict_rejects_non_image():
+    response = client.post(
+        "/predict",
+        files={"file": ("board.txt", b"not-an-image", "text/plain")},
+    )
+    assert response.status_code == 415
+
+
+def test_predict_rejects_large_upload(monkeypatch):
+    monkeypatch.setattr("app.main.MAX_UPLOAD_BYTES", 1)
+    response = client.post(
+        "/predict",
+        files={"file": ("board.jpg", b"12", "image/jpeg")},
+    )
+    assert response.status_code == 413
