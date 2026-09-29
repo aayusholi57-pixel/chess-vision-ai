@@ -24,8 +24,8 @@ def seed_everything(seed):
 
 def build_model(num_classes):
     model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
-    for p in model.parameters():
-        p.requires_grad = False
+    for parameter in model.parameters():
+        parameter.requires_grad = False
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
@@ -54,14 +54,33 @@ def train(args):
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(len(classes)).to(device)
-
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-    optimizer = torch.optim.AdamW(model.fc.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Stage 1: train the classification head while preserving ImageNet features.
+    optimizer = torch.optim.AdamW(model.fc.parameters(), lr=args.head_lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(args.warmup_epochs, 1)
+    )
 
     best_loss = float("inf")
     history = []
+
     for epoch in range(1, args.epochs + 1):
+        if epoch == args.warmup_epochs + 1:
+            # Stage 2: fine-tune the final residual block and classifier at lower LR.
+            for parameter in model.layer4.parameters():
+                parameter.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": model.layer4.parameters(), "lr": args.finetune_lr},
+                    {"params": model.fc.parameters(), "lr": args.head_lr * 0.1},
+                ],
+                weight_decay=1e-4,
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(args.epochs - args.warmup_epochs, 1)
+            )
+
         model.train()
         loss_sum = correct = total = 0
         for images, labels in train_loader:
@@ -70,6 +89,7 @@ def train(args):
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             loss_sum += loss.item() * labels.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
@@ -79,46 +99,55 @@ def train(args):
         scheduler.step()
         record = {
             "epoch": epoch,
+            "stage": "head" if epoch <= args.warmup_epochs else "fine_tune_layer4",
             "train_loss": loss_sum / total,
             "train_accuracy": correct / total,
             "val_loss": val_loss,
             "val_accuracy": val_acc,
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rates": [group["lr"] for group in optimizer.param_groups],
         }
         history.append(record)
         print(json.dumps(record))
 
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "classes": classes,
-                "architecture": "resnet18",
-                "image_size": 224,
-                "mean": [0.485, 0.456, 0.406],
-                "std": [0.229, 0.224, 0.225],
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_accuracy": val_acc,
-            }, model_dir / "resnet18_chess_best.pth")
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "classes": classes,
+                    "architecture": "resnet18",
+                    "image_size": 224,
+                    "mean": [0.485, 0.456, 0.406],
+                    "std": [0.229, 0.224, 0.225],
+                    "epoch": epoch,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_acc,
+                },
+                model_dir / "resnet18_chess_best.pth",
+            )
 
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "classes": classes,
-        "architecture": "resnet18",
-        "image_size": 224,
-        "mean": [0.485, 0.456, 0.406],
-        "std": [0.229, 0.224, 0.225],
-    }, model_dir / "resnet18_chess.pth")
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "classes": classes,
+            "architecture": "resnet18",
+            "image_size": 224,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+        },
+        model_dir / "resnet18_chess.pth",
+    )
     (model_dir / "training_history.json").write_text(json.dumps(history, indent=2))
     print(f"Training complete on {device}. Best validation loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=15)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--seed", type=int, default=42)
-    train(p.parse_args())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--warmup-epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--head-lr", type=float, default=1e-3)
+    parser.add_argument("--finetune-lr", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    train(parser.parse_args())
