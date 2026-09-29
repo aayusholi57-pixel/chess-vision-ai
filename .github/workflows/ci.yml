@@ -1,77 +1,36 @@
-name: Build & Test
+name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
     branches: [main]
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest pytest-cov
-      
-      - name: Run tests
-        run: |
-          pytest tests/ -v --cov=app --cov-report=xml
-      
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
+          python-version: "3.10"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m compileall -q app training tests
+      - run: ruff check app training tests
+      - run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=70
 
-  build:
-    needs: test
+  docker:
+    needs: quality
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-      
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          tags: chess-vision-ai:latest
+          tags: chess-vision-ai:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  lint:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      
-      - name: Install linters
-        run: |
-          pip install pylint flake8
-      
-      - name: Lint with flake8
-        run: flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        continue-on-error: true
-      
-      - name: Lint with pylint
-        run: pylint app/ --disable=all --enable=E,F
-        continue-on-error: true
