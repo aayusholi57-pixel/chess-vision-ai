@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+select = ["E", "F", "I", "B", "UP"]
+exclude = [".venv", "models", "dataset"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
