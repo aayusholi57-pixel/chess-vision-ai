@@ -1,131 +1,124 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torchvision import models
 from torchvision.models import ResNet18_Weights
-from dataset import get_data_loaders
-import os
 
-def train_model(epochs=10):
-    print("[*] Initializing ResNet-18 Chess Piece Classifier...")
+from training.dataset import get_data_loaders
 
-    # Change to parent directory to find dataset
-   # 1. Dynamically find the project root and dataset folder
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(current_dir)
-    data_path = os.path.join(project_root, "dataset")
 
-    # 2. Get our Train DataLoaders using the absolute path
-    train_loader, val_loader = get_data_loaders(data_dir=data_path, batch_size=32)
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    # 2. Load ResNet-18 with pre-trained ImageNet weights
-    weights = ResNet18_Weights.DEFAULT
-    model = models.resnet18(weights=weights)
 
-    # 3. Freeze early layers (transfer learning)
-    for param in model.parameters():
-        param.requires_grad = False
+def build_model(num_classes):
+    model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
 
-    # 4. Replace the final classification layer
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, 13)
 
-    # 5. Define Loss Function and Optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.fc.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-    # 6. Check if GPU is available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    print(f"[*] Using device: {device}")
-
-    # 7. Complete Training Loop
-    print(f"[*] Starting training for {epochs} epochs...\n")
-
-    best_val_loss = float('inf')
-
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for batch_idx, (images, labels) in enumerate(train_loader):
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    loss_sum = correct = total = 0
+    with torch.inference_mode():
+        for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
+            logits = model(images)
+            loss_sum += criterion(logits, labels).item() * labels.size(0)
+            correct += (logits.argmax(1) == labels).sum().item()
+            total += labels.size(0)
+    return loss_sum / total, correct / total
 
-            # Zero gradients, forward pass, calculate loss, backward pass, update
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+
+def train(args):
+    seed_everything(args.seed)
+    root = Path(__file__).resolve().parents[1]
+    model_dir = root / "models"
+    model_dir.mkdir(exist_ok=True)
+
+    train_loader, val_loader, classes = get_data_loaders(
+        root / "dataset", args.batch_size, args.workers
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(len(classes)).to(device)
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(model.fc.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    best_loss = float("inf")
+    history = []
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        loss_sum = correct = total = 0
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(images)
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
-
-            running_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
+            loss_sum += loss.item() * labels.size(0)
+            correct += (logits.argmax(1) == labels).sum().item()
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
 
-        avg_train_loss = running_loss / len(train_loader)
-        train_acc = 100 * correct / total
-
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-
-        avg_val_loss = val_loss / len(val_loader)
-        val_acc = 100 * val_correct / val_total
-
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         scheduler.step()
+        record = {
+            "epoch": epoch,
+            "train_loss": loss_sum / total,
+            "train_accuracy": correct / total,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+        history.append(record)
+        print(json.dumps(record))
 
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
-              f"Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "classes": classes,
+                "architecture": "resnet18",
+                "image_size": 224,
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225],
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "val_accuracy": val_acc,
+            }, model_dir / "resnet18_chess_best.pth")
 
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            os.makedirs("models", exist_ok=True)
-            best_model_path = "models/resnet18_chess_best.pth"
-            torch.save(model.state_dict(), best_model_path)
-            print(f"    [+] Best model saved!")
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "classes": classes,
+        "architecture": "resnet18",
+        "image_size": 224,
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+    }, model_dir / "resnet18_chess.pth")
+    (model_dir / "training_history.json").write_text(json.dumps(history, indent=2))
+    print(f"Training complete on {device}. Best validation loss: {best_loss:.4f}")
 
-    print("\n[*] Training complete!")
-
-    # 8. Save the final trained model weights
-    os.makedirs("models", exist_ok=True)
-    model_path = "models/resnet18_chess.pth"
-    torch.save(model.state_dict(), model_path)
-    print(f"[+] Final model saved to {model_path}")
 
 if __name__ == "__main__":
-    train_model(epochs=10)
-
-def train_model(epochs=10):
-    print("[*] Initializing ResNet-18 Chess Piece Classifier...")
-
-    # Get the directory where train.py is located (.../training)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Go up one level to the project root (.../chess-vision-ai)
-    project_root = os.path.dirname(current_dir)
-    
-    # Define the exact path to the dataset folder
-    data_path = os.path.join(project_root, "dataset")
-
-    # 1. Get our Train DataLoaders using the absolute path
-    train_loader, val_loader = get_data_loaders(data_dir=data_path, batch_size=32)
-
-    # 2. Load ResNet-18 with pre-trained ImageNet weights
-    # ... (rest of your code remains exactly the same)
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
+    train(p.parse_args())
