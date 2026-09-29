@@ -1,0 +1,27 @@
+name: Train Chess Model
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - run: python -m training.train --epochs 15 --workers 2
+      - run: python -m training.evaluate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chess-vision-model
+          path: |
+            models/resnet18_chess_best.pth
+            models/resnet18_chess.pth
+            models/training_history.json
+            models/evaluation.json
