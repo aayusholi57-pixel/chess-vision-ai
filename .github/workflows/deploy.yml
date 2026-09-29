@@ -1,40 +1,60 @@
-name: Build & Push
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  build-and-push:
+  train:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-      
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+      - uses: actions/setup-python@v6
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Extract metadata
+          python-version: "3.10"
+          cache: pip
+      - run: pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - run: python -m training.train --epochs 15 --workers 2
+      - run: python -m training.evaluate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-model
+          path: |
+            models/resnet18_chess_best.pth
+            models/resnet18_chess.pth
+            models/training_history.json
+            models/evaluation.json
+
+  container:
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-model
+          path: models
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
         id: meta
-        uses: docker/metadata-action@v4
         with:
-          images: ${{ secrets.DOCKER_USERNAME }}/chess-vision-ai
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
-      
-      - name: Build and push
-        uses: docker/build-push-action@v5
+            type=ref,event=tag
+            type=sha
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
