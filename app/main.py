@@ -1,93 +1,97 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import os
-import tempfile
+from __future__ import annotations
+
+import logging
 import shutil
+import tempfile
 from pathlib import Path
 
-# Import our custom modules
-from app.board import reconstruct_board_from_squares, load_chess_model
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.board import load_chess_model, predict_squares
+from app.chess_engine import analyze_position
+from app.config import ALLOWED_ORIGINS, MAX_UPLOAD_BYTES, MIN_CONFIDENCE
 from app.fen import matrix_to_fen
 from app.preprocessing import process_uploaded_image
-from app.chess_engine import analyze_position
 
-app = FastAPI(title="Chess Vision AI", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Chess Vision AI",
+    version="2.0.0",
+    description="Chessboard image recognition, FEN reconstruction and rule validation.",
 )
 
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
+
 @app.get("/health")
-async def health_check():
-    """Health check endpoint for container orchestration."""
-    _, _, is_trained = load_chess_model()
-    model_status = "trained" if is_trained else "untrained (predictions will be unreliable)"
-    return {"status": "healthy", "model": model_status}
+def health():
+    _, _, status = load_chess_model()
+    if not status or not status.get("ready"):
+        raise HTTPException(status_code=503, detail=status or {"ready": False})
+    return {"status": "healthy", "model": status}
+
+
+@app.get("/ready")
+def ready():
+    return health()
+
 
 @app.post("/predict")
 async def predict_board(file: UploadFile = File(...)):
-    """
-    Accepts a chessboard image, processes it, and returns FEN notation + analysis.
-    
-    Note: Predictions require a trained model. If using an untrained model,
-    all predictions will be random. Train your model and save to models/resnet18_chess.pth
-    """
-    # Validate file type
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    
-    # Create a secure temporary directory
-    temp_dir = tempfile.mkdtemp(prefix="chess_vision_")
-    temp_image_path = None
-    
+    content_type = (file.content_type or "").lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Only image uploads are supported.")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="chess_vision_"))
+    upload_path = temp_dir / "input_image"
     try:
-        # Secure file path handling
-        temp_image_path = os.path.join(temp_dir, "upload.jpg")
-        
-        # Save uploaded file
-        with open(temp_image_path, "wb") as buffer:
-            content = await file.read()
-            if len(content) > 50 * 1024 * 1024:  # 50MB limit
-                raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-            buffer.write(content)
-        
-        # 1. OpenCV Preprocessing
-        squares_dir = process_uploaded_image(temp_image_path, output_dir=os.path.join(temp_dir, "squares"))
-        
-        # 2. PyTorch Inference
-        matrix = reconstruct_board_from_squares(squares_dir=squares_dir)
-        
-        # 3. FEN Generation
-        fen_string = matrix_to_fen(matrix)
-        
-        # 4. Chess Engine Analysis
-        engine_analysis = analyze_position(fen_string)
-        
-        # 5. Check model training status
-        _, _, is_trained = load_chess_model()
-        
+        total = 0
+        with upload_path.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Image exceeds the upload limit.")
+                output.write(chunk)
+
+        squares = process_uploaded_image(upload_path, temp_dir / "squares")
+        board, confidence = predict_squares(squares)
+        fen = matrix_to_fen(board)
+        analysis = analyze_position(fen)
+
+        low_confidence = [
+            {"row": r + 1, "column": c + 1, "piece": board[r][c], "confidence": confidence[r][c]}
+            for r in range(8) for c in range(8)
+            if confidence[r][c] < MIN_CONFIDENCE
+        ]
         return {
             "filename": file.filename,
-            "fen": fen_string,
-            "engine_analysis": engine_analysis,
-            "board_matrix": matrix,
-            "warning": "Model is untrained. Predictions are unreliable." if not is_trained else None
+            "fen": fen,
+            "board_matrix": board,
+            "confidence_matrix": confidence,
+            "low_confidence_squares": low_confidence,
+            "chess_analysis": analysis,
         }
-        
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected prediction failure")
+        raise HTTPException(status_code=500, detail="Internal processing error.") from exc
     finally:
-        # Guaranteed cleanup of temporary files
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
