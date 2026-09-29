@@ -68,5 +68,9 @@ def test_preprocessing_rejects_non_image(tmp_path):
         process_uploaded_image(bad, tmp_path / "squares")
 
 
+def test_health_without_model_is_not_healthy():
+    assert client.get("/health").status_code == 503
+
+
 def test_predict_without_file():
     assert client.post("/predict").status_code == 422
